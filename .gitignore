@@ -6,3 +6,6 @@
 bin/
 
 .DS_Store
+
+#Для теста
+trip.json
