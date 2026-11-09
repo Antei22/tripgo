@@ -1,19 +1,20 @@
-package trips
+package trip
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/Masterminds/squirrel"
-	"github.com/antei22/tripgo/internal/database"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/antei22/tripgo/internal/database"
+	domain "github.com/antei22/tripgo/internal/domain/trip"
 )
 
 var sqlBuilder = squirrel.StatementBuilder.
@@ -50,7 +51,7 @@ func NewRepository(
 
 func (repo *Repository) Create(
 	ctx context.Context,
-	trip Trip,
+	trip domain.Trip,
 ) error {
 	query, args, err := sqlBuilder.
 		Insert("trips").
@@ -103,7 +104,7 @@ func (repo *Repository) Create(
 		postgresError.Code == "23505" &&
 		postgresError.ConstraintName ==
 			"trips_one_active_per_driver_idx" {
-		return ErrDriverBusy
+		return domain.ErrDriverBusy
 	}
 
 	return fmt.Errorf("insert trip: %w", err)
@@ -112,8 +113,8 @@ func (repo *Repository) Create(
 func (repo *Repository) AddStatusHistory(
 	ctx context.Context,
 	tripID uuid.UUID,
-	fromStatus *Status,
-	toStatus Status,
+	fromStatus *domain.Status,
+	toStatus domain.Status,
 	reason *string,
 ) error {
 	var fromStatusValue any
@@ -161,7 +162,7 @@ func (repo *Repository) AddStatusHistory(
 func (repo *Repository) Get(
 	ctx context.Context,
 	tripID uuid.UUID,
-) (Trip, error) {
+) (domain.Trip, error) {
 	query, args, err := sqlBuilder.
 		Select(tripColumns...).
 		From("trips").
@@ -170,7 +171,7 @@ func (repo *Repository) Get(
 		}).
 		ToSql()
 	if err != nil {
-		return Trip{}, fmt.Errorf(
+		return domain.Trip{}, fmt.Errorf(
 			"build select trip query: %w",
 			err,
 		)
@@ -188,81 +189,52 @@ func (repo *Repository) Get(
 		executor.QueryRow(queryCtx, query, args...),
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Trip{}, ErrTripNotFound
+		return domain.Trip{}, domain.ErrTripNotFound
 	}
 	if err != nil {
-		return Trip{}, fmt.Errorf("scan trip: %w", err)
+		return domain.Trip{}, fmt.Errorf("scan trip: %w", err)
 	}
 
 	return trip, nil
 }
 
-func (repo *Repository) FinishActive(
-	ctx context.Context,
-	tripID uuid.UUID,
-	finishedAt time.Time,
-) (Trip, error) {
-	query, args, err := sqlBuilder.
-		Update("trips").
-		Set("status", string(StatusCompleted)).
-		Set("finished_at", finishedAt).
-		Set("updated_at", finishedAt).
-		Where(squirrel.Eq{
-			"id":     tripID,
-			"status": string(StatusActive),
-		}).
-		Suffix(
-			"RETURNING " + strings.Join(tripColumns, ", "),
-		).
-		ToSql()
+func (repo *Repository) GetForUpdate(ctx context.Context, tripID uuid.UUID) (domain.Trip, error) {
+	query, args, err := sqlBuilder.Select(tripColumns...).From("trips").Where(squirrel.Eq{"id": tripID}).Suffix("FOR UPDATE").ToSql()
 	if err != nil {
-		return Trip{}, fmt.Errorf(
-			"build finish trip query: %w",
-			err,
-		)
+		return domain.Trip{}, fmt.Errorf("build locked trip query: %w", err)
 	}
-
-	queryCtx, cancel := context.WithTimeout(
-		ctx,
-		repo.queryTimeout,
-	)
+	queryCtx, cancel := context.WithTimeout(ctx, repo.queryTimeout)
 	defer cancel()
-
-	executor := database.Executor(queryCtx, repo.pool)
-
-	trip, err := scanTrip(
-		executor.QueryRow(queryCtx, query, args...),
-	)
-	if err == nil {
-		return trip, nil
+	trip, err := scanTrip(database.Executor(queryCtx, repo.pool).QueryRow(queryCtx, query, args...))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Trip{}, domain.ErrTripNotFound
 	}
-
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return Trip{}, fmt.Errorf("update trip status: %w", err)
+	if err != nil {
+		return domain.Trip{}, fmt.Errorf("fetch locked trip: %w", err)
 	}
+	return trip, nil
+}
 
-	existingTrip, getErr := repo.Get(ctx, tripID)
-	if getErr != nil {
-		return Trip{}, getErr
+func (repo *Repository) SaveFinished(ctx context.Context, trip domain.Trip) error {
+	query, args, err := sqlBuilder.Update("trips").Set("status", string(trip.Status)).Set("finished_at", trip.FinishedAt).Set("updated_at", trip.FinishedAt).Where(squirrel.Eq{"id": trip.ID}).ToSql()
+	if err != nil {
+		return fmt.Errorf("build finish trip query: %w", err)
 	}
-
-	if existingTrip.Status == StatusCompleted {
-		return Trip{}, ErrTripCompleted
+	queryCtx, cancel := context.WithTimeout(ctx, repo.queryTimeout)
+	defer cancel()
+	_, err = database.Executor(queryCtx, repo.pool).Exec(queryCtx, query, args...)
+	if err != nil {
+		return fmt.Errorf("update trip: %w", err)
 	}
-
-	return Trip{}, fmt.Errorf(
-		"trip %s was not updated from status %q",
-		tripID,
-		existingTrip.Status,
-	)
+	return nil
 }
 
 type rowScanner interface {
 	Scan(dest ...any) error
 }
 
-func scanTrip(row rowScanner) (Trip, error) {
-	var trip Trip
+func scanTrip(row rowScanner) (domain.Trip, error) {
+	var trip domain.Trip
 	var status string
 	var finishedAt pgtype.Timestamptz
 
@@ -280,10 +252,10 @@ func scanTrip(row rowScanner) (Trip, error) {
 		&finishedAt,
 	)
 	if err != nil {
-		return Trip{}, err
+		return domain.Trip{}, err
 	}
 
-	trip.Status = Status(status)
+	trip.Status = domain.Status(status)
 
 	if finishedAt.Valid {
 		value := finishedAt.Time

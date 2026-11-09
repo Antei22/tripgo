@@ -395,7 +395,7 @@ Read Committed
 Он выбран потому, что безопасность конкурентных операций обеспечивается не последовательным выполнением всех транзакций, а конкретными ограничениями и атомарными запросами:
 
 - запрет двух активных поездок обеспечивается уникальным индексом;
-- конкурентное завершение защищено условием непосредственно в `UPDATE`.
+- Concurrent finish is protected by a row lock inside the transaction.
 
 Это позволяет использовать стандартный уровень изоляции PostgreSQL без лишних serialization failures.
 
@@ -419,28 +419,9 @@ CREATE UNIQUE INDEX trips_one_active_per_driver_idx
 
 Ошибка PostgreSQL с кодом `23505` и именем этого индекса преобразуется в доменную ошибку `ErrDriverBusy`.
 
-## Защита конкурентного завершения
+## Concurrent finish
 
-Завершение выполняется условным запросом:
-
-```sql
-UPDATE trips
-SET
-    status = 'completed',
-    finished_at = $1,
-    updated_at = $1
-WHERE id = $2
-  AND status = 'active'
-RETURNING ...;
-```
-
-Если два запроса одновременно завершают одну поездку, только один из них обновляет строку.
-
-Результат:
-
-- один запрос получает `200`;
-- второй получает `409 trip_completed`;
-- поле `finished_at` не перезаписывается.
+- Concurrent finish is protected by a row lock inside the transaction.
 
 ## Проверка конкурентного создания
 
@@ -501,18 +482,20 @@ service stopped gracefully
 ## Структура проекта
 
 ```text
-cmd/trip-service/          точка входа
-internal/config/           чтение и проверка конфигурации
-internal/database/         подключение к БД и TxManager
-internal/generated/        сгенерированный OpenAPI-код
-internal/httpserver/       HTTP-обработчики и роутер
-internal/trips/            модель, repository и бизнес-операции
-migrations/                goose-миграции
-contracts/                 внешние контракты курса
-oapi-codegen.yaml          конфигурация генерации OpenAPI
-environment.toml           состав локального окружения
-Makefile                   команды проекта
-.env.example               пример переменных окружения
+cmd/trip-service/          application entry point
+internal/config/           environment configuration
+internal/container/        dependency wiring
+internal/domain/trip/      trip rules and errors
+internal/usecase/trip/     create, get and finish scenarios
+internal/http/trip/        handlers for each action
+internal/httpserver/       OpenAPI adapter and middleware
+internal/http/domainerror/ error mapping
+internal/repository/trip/  PostgreSQL adapter
+internal/database/         connection pool and transactions
+internal/infra/telemetry/  OpenTelemetry setup
+internal/generated/        generated OpenAPI code
+migrations/                goose migrations
+contracts/                 course contracts
 ```
 
 ## Финальная проверка
@@ -535,3 +518,23 @@ git status
 ```
 
 Файлы `.env`, `.tripgo/`, `bin/` и `trip.json` не должны попадать в коммит.
+
+## Architecture
+
+`cmd/trip-service` loads configuration, starts and shuts down the application. `internal/container` constructs and connects the PostgreSQL pool, transaction manager, use cases and HTTP handlers. Each operation has its own package under `internal/usecase/trip/{create,get,finish}` and `internal/http/trip/{create,get,finish}`. Interfaces are declared by their consumers in `contract.go` and generated mocks are kept alongside tests. `internal/domain/trip` owns validation, errors and status transitions; `internal/repository/trip` implements persistence. Transport and infrastructure depend inward; the domain does not import HTTP, pgx or telemetry. The generated OpenAPI adapter delegates to the individual handlers.
+
+Telemetry is exported over OTLP using `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL` (`http/protobuf` or `grpc`) and `OTEL_TRACES_SAMPLER` from the `.env` created by `tripgoctl`. The service records HTTP and database spans, structured logs with trace identifiers, HTTP/database duration metrics and trip counters. The active trips gauge reads the current database state, including trips created before a restart.
+
+Run `make test` for unit tests with race detection and coverage; `make test-integration` requires the lab PostgreSQL and applied migrations. Both commands can be repeated. `make generate` regenerates OpenAPI code and mocks; `make lint` runs the pinned golangci-lint version. To reproduce the observability checks, start the lab 2 environment, run `tripgoctl connect`, make a request, then find its `trace_id` in Jaeger and the HTTP and trip metrics in Grafana.
+
+### Telemetry configuration
+
+| Variable | Meaning |
+|---|---|
+| `OTEL_SERVICE_NAME` | Service name, normally `trip-service` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector URL provided by `tripgoctl` |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` or `grpc` |
+| `OTEL_TRACES_SAMPLER` | Trace sampling policy |
+| `OTEL_RESOURCE_ATTRIBUTES` | Additional resource attributes |
+
+The test command reports aggregate coverage for the domain and use-case packages. The integration test uses `DATABASE_URL`, creates its own trip and deletes it during cleanup; the lab migrations must already be applied. Run `make test-integration` after `tripgoctl connect` and `make migrate`.

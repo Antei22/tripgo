@@ -3,14 +3,15 @@ package httpserver
 import (
 	"net/http"
 
-	api "github.com/antei22/tripgo/internal/generated"
 	"github.com/go-chi/chi/v5"
+
+	api "github.com/antei22/tripgo/internal/generated"
 )
 
 func NewRouter(handler *Handler) http.Handler {
 	router := chi.NewRouter()
 
-	return api.HandlerWithOptions(
+	api.HandlerWithOptions(
 		handler,
 		api.ChiServerOptions{
 			BaseRouter: router,
@@ -18,4 +19,5 @@ func NewRouter(handler *Handler) http.Handler {
 			ErrorHandlerFunc: handler.writeParameterError,
 		},
 	)
+	return instrument(router, handler.logger)
 }

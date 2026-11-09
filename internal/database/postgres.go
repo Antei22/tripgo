@@ -4,8 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/antei22/tripgo/internal/config"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/antei22/tripgo/internal/config"
 )
 
 func Open(
@@ -17,6 +18,11 @@ func Open(
 		return nil, fmt.Errorf("parse database config: %w", err)
 	}
 
+	tracer, err := newQueryTracer()
+	if err != nil {
+		return nil, fmt.Errorf("create database tracer: %w", err)
+	}
+	poolConfig.ConnConfig.Tracer = tracer
 	poolConfig.MaxConns = cfg.MaxConns
 	poolConfig.MinConns = cfg.MinConns
 	poolConfig.MaxConnLifetime = cfg.MaxConnLifetime

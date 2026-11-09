@@ -11,9 +11,8 @@ import (
 	"syscall"
 
 	"github.com/antei22/tripgo/internal/config"
-	"github.com/antei22/tripgo/internal/database"
-	"github.com/antei22/tripgo/internal/httpserver"
-	"github.com/antei22/tripgo/internal/trips"
+	"github.com/antei22/tripgo/internal/container"
+	"github.com/antei22/tripgo/internal/infra/telemetry"
 )
 
 func main() {
@@ -34,19 +33,21 @@ func run() error {
 	}
 
 	// 2. Настраиваем JSON-логи.
-	logger := slog.New(
-		slog.NewJSONHandler(
-			os.Stdout,
-			&slog.HandlerOptions{
-				Level: cfg.LogLevel,
-			},
-		),
-	).With(
-		"service",
-		"trip-service",
-	)
-
-	slog.SetDefault(logger)
+	logger, shutdownTelemetry, err := telemetry.Setup(context.Background(), cfg.LogLevel)
+	if err != nil {
+		return fmt.Errorf("setup telemetry: %w", err)
+	}
+	var closePool func()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+		defer cancel()
+		if err := shutdownTelemetry(ctx); err != nil {
+			logger.Error("telemetry shutdown failed", "error", err)
+		}
+		if closePool != nil {
+			closePool()
+		}
+	}()
 
 	appCtx, stop := signal.NotifyContext(
 		context.Background(),
@@ -55,45 +56,11 @@ func run() error {
 	)
 	defer stop()
 
-	pool, err := database.Open(appCtx, cfg.Database)
+	server, pool, err := container.New(appCtx, cfg, logger)
 	if err != nil {
-		return fmt.Errorf("open database: %w", err)
+		return fmt.Errorf("initialize container: %w", err)
 	}
-	defer pool.Close()
-
-	// 5. Собираем зависимости приложения.
-	repository := trips.NewRepository(
-		pool,
-		cfg.Database.QueryTimeout,
-	)
-
-	txManager := database.NewManager(
-		pool,
-		cfg.Database.QueryTimeout,
-	)
-
-	service := trips.NewService(
-		repository,
-		txManager,
-	)
-
-	handler := httpserver.NewHandler(
-		service,
-		pool,
-		cfg.Database.QueryTimeout,
-		logger,
-	)
-
-	router := httpserver.NewRouter(handler)
-
-	server := &http.Server{
-		Addr:              cfg.HTTP.Addr,
-		Handler:           router,
-		ReadTimeout:       cfg.HTTP.ReadTimeout,
-		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
-		WriteTimeout:      cfg.HTTP.WriteTimeout,
-		IdleTimeout:       cfg.HTTP.IdleTimeout,
-	}
+	closePool = pool.Close
 
 	serverErrors := make(chan error, 1)
 
